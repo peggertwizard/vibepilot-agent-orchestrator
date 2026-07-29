@@ -1,0 +1,15 @@
+node_modules/
+out/
+dist/
+*.log
+.vite/
+
+# Build artefacts and stray files from tooling.
+*.tsbuildinfo
+
+# Stray files from tooling that wrote a Windows path as a filename.
+C:*
+
+# Never commit environment files.
+.env
+.env.*
