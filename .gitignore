@@ -1,0 +1,29 @@
+node_modules/
+out/
+dist/
+*.log
+.vite/
+
+# Build artefacts and stray files from tooling.
+*.tsbuildinfo
+
+# Stray files from tooling that wrote a Windows path as a filename.
+C:*
+
+# Never commit environment files.
+.env
+.env.*
+
+# Zero-byte artefacts from a notification hook whose path was not quoted. Harmless, but they
+# land in the repo root and would otherwise show up as untracked work on every merge.
+C:Users*
+
+# vibePilot's own memory, in vibePilot's own repo.
+#
+# In a *user's* project these files are committed deliberately — see `MACHINE_OWNED_PREFIX` in
+# git/repo.ts — because versioned memory is worth having and the merge path handles it. This
+# repo is different: it is published publicly, and everything under here is written by a model
+# from whatever the conversation contained. Nothing personal gets to reach a public repo by
+# accident, so here the folder simply stays out of git. Both arrangements work; this one is
+# the one that cannot leak.
+.vibepilot/

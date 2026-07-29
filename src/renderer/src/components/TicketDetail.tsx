@@ -1,0 +1,646 @@
+import { useCallback, useEffect, useState } from 'react'
+import type {
+  Agent,
+  EffortLevel,
+  PreviewInfo,
+  Ticket,
+  TicketDetail as Detail,
+} from '@shared/types'
+import {
+  EFFORT_OPTIONS,
+  MODEL_OPTIONS,
+  totalTokens,
+  STEP_BUDGET_USD,
+  STEP_LABEL,
+  effortDefaultFor,
+  formatTokens,
+  prettyModel,
+  routeSummary,
+} from '@shared/types'
+import { Button, Input, PhaseStrip, Tag } from './ui'
+import { Icon } from './ui/Icon'
+import { Markdown } from './ui/Markdown'
+
+/**
+ * Opening a ticket.
+ *
+ * Clicking one used to do nothing: there was no detail pane, modal or drawer anywhere in the
+ * renderer, and the only editable field on a ticket in the whole app was which lane it sat in,
+ * changed by dragging it. Everything below was already recorded and rendered nowhere — the
+ * body, the route rationale, per-step effort, the branch, the worktree, the cost.
+ *
+ * A **panel, not a modal**: a modal blocks the board behind it, and the reason to open a ticket
+ * is usually to compare it with the others.
+ *
+ * This is the ticket *during and after*; the presentation card (plan 10) is the moment
+ * *before*. They show overlapping information and are deliberately not the same surface —
+ * one is transient and lives in the chat, this one is permanent and opens whenever you want it.
+ */
+export function TicketDetail({
+  ticketId,
+  projectId,
+  agents,
+  baseBranch,
+  onClose,
+}: {
+  ticketId: string
+  projectId: string
+  agents: Agent[]
+  baseBranch: string
+  onClose: () => void
+}) {
+  const [d, setD] = useState<Detail | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [title, setTitle] = useState('')
+  const [body, setBody] = useState('')
+  const [budget, setBudget] = useState('')
+  const [approving, setApproving] = useState(false)
+
+  const load = (): void => {
+    void window.vibepilot.tickets.detail(ticketId).then((next) => {
+      setD(next)
+      if (next) {
+        setTitle(next.ticket.title)
+        setBody(next.ticket.body)
+        setBudget(next.ticket.budgetUsd === null ? '' : String(next.ticket.budgetUsd))
+      }
+    })
+  }
+  useEffect(load, [ticketId])
+
+  // Re-read when anything about this ticket moves. The detail is entirely derived, so there is
+  // nothing to reconcile — just ask again.
+  useEffect(
+    () =>
+      window.vibepilot.bus.subscribe((batch) => {
+        if (batch.domain.some((e) => e.type === 'tickets:changed' || e.type === 'routes:changed')) {
+          load()
+        }
+      }),
+    [ticketId],
+  )
+
+  if (!d) return null
+  const t = d.ticket
+  const route = d.accepted ?? d.proposed
+  const step = route?.steps.find((s) => s.status === 'active' || s.status === 'rework') ?? null
+  /*
+   * The step waiting on you. Only on an ACCEPTED route: a gate on a route still being
+   * proposed is a shape you have not agreed to yet, so approving it would skip a decision.
+   */
+  const gatedStep = d.accepted?.steps.find((s) => s.status === 'pending' && s.gate) ?? null
+  const detail = d
+  const open = d.findings.filter((f) => !f.resolvedAt)
+
+  const save = async (): Promise<void> => {
+    await window.vibepilot.tickets.update(projectId, t.id, {
+      title: title.trim() || t.title,
+      body,
+      budgetUsd: budget.trim() ? Math.max(0, Number(budget) || 0) : null,
+    })
+    setEditing(false)
+    load()
+  }
+
+  /*
+   * Tokens actually put through a model, counted once each — the same figure the agent chips
+   * and the message chips show, so a ticket and the agents working it never disagree.
+   *
+   * Cache reads are excluded: they are the same conversation re-sent on every round-trip, which
+   * is where the old inflation came from — 225k of distinct content reading as 9.27M.
+   */
+  const tokens = totalTokens(d.spend)
+  const allowed = t.budgetUsd ?? STEP_BUDGET_USD[step?.kind ?? 'build']
+
+  return (
+    <aside
+      style={{
+        position: 'absolute',
+        top: 0,
+        right: 0,
+        bottom: 0,
+        width: 420,
+        maxWidth: '100%',
+        zIndex: 25,
+        background: 'var(--surface)',
+        borderLeft: '1px solid var(--line)',
+        boxShadow: 'var(--shadow-lg)',
+        display: 'flex',
+        flexDirection: 'column',
+        minHeight: 0,
+      }}
+    >
+      <header
+        style={{
+          flex: 'none',
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 8,
+          padding: '11px 13px',
+          borderBottom: '1px solid var(--line)',
+        }}
+      >
+        <span className="meta tnum">#{t.number}</span>
+        <span style={{ flex: 1, font: '600 14px var(--font-heading)', minWidth: 0 }} className="ellip">
+          {t.title}
+        </span>
+        {t.readyToMerge && <Tag tone="ok">ready</Tag>}
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          style={{ border: 'none', background: 'transparent', color: 'var(--muted)', cursor: 'pointer' }}
+        >
+          <Icon name="close" size={13} />
+        </button>
+      </header>
+
+      <div
+        className="scroll-y"
+        style={{ flex: 1, minHeight: 0, padding: 13, display: 'flex', flexDirection: 'column', gap: 15 }}
+      >
+        {/*
+          Look at it before you merge it.
+
+          Only offered once there is a worktree with something in it — a preview of a branch
+          with no commits would serve the base branch and quietly look like it worked.
+        */}
+        {/*
+          The sign-off, with the plan in front of you.
+
+          The whole reason to plan before building is to make this decision well, and until
+          now the decision was asked for *before* the plan existed — or, more often, the route
+          simply never started because there was no way to say "plan yes, build not yet".
+        */}
+        {gatedStep && (
+          <Section title={`Your sign-off before ${STEP_LABEL[gatedStep.kind]}`}>
+            {detail.planMd ? (
+              <div
+                className="scroll-y selectable"
+                style={{
+                  maxHeight: 280,
+                  padding: 9,
+                  background: 'var(--paper)',
+                  border: '1px solid var(--line)',
+                  marginBottom: 8,
+                }}
+              >
+                <Markdown text={detail.planMd} />
+              </div>
+            ) : (
+              <p style={{ ...para, marginBottom: 8 }}>
+                No <code>plan.md</code> was written, so there is nothing to read here — approve
+                only if you already know what this will do.
+              </p>
+            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Button
+                kind="primary"
+                height={27}
+                disabled={approving}
+                onClick={() => {
+                  setApproving(true)
+                  void window.vibepilot.gates
+                    .approve(t.projectId, t.id)
+                    .finally(() => setApproving(false))
+                }}
+              >
+                {approving ? 'Starting…' : `Approve — start ${STEP_LABEL[gatedStep.kind]}`}
+              </Button>
+              <span className="meta">
+                Nothing has been built yet. Say what you want changed in the chat instead, and
+                the Pilot will re-plan it.
+              </span>
+            </div>
+          </Section>
+        )}
+
+        {t.worktreePath && <PreviewPanel ticket={t} />}
+
+        {/* The route, with the rationale that was shown once on the proposal card and never again. */}
+        {route && (
+          <Section title={routeSummary(route.steps)}>
+            {route.rationale && (
+              <p className="selectable" style={{ ...para, marginBottom: 4 }}>
+                {route.rationale}
+              </p>
+            )}
+            {/*
+              The phases, with who and on what. Sometimes one, sometimes three — the route is
+              per ticket, so a small fix honestly shows a single marker rather than being drawn
+              as though it needed a committee.
+            */}
+            <div style={{ marginBottom: 8 }}>
+              <PhaseStrip
+                steps={route.steps}
+                nameFor={(id) => agents.find((a) => a.id === id)?.name ?? null}
+                modelFor={(id) => {
+                  const a = agents.find((x) => x.id === id)
+                  return a ? prettyModel(a.resolvedModel, a.model) : null
+                }}
+              />
+            </div>
+            {route.steps.map((s) => {
+              const who = agents.find((a) => a.id === s.assigneeAgentId) ?? null
+              return (
+                <div key={s.id} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, flexWrap: 'wrap' }}>
+                    <span
+                      style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: 'var(--radius-sm)',
+                        background:
+                          s.status === 'done'
+                            ? 'var(--ok)'
+                            : s.status === 'pending'
+                              ? 'var(--line)'
+                              : 'var(--accent)',
+                        flex: 'none',
+                      }}
+                    />
+                    <span className="cap">{STEP_LABEL[s.kind]}</span>
+                    <span style={{ fontSize: 12, fontWeight: 600 }}>{who?.name ?? 'nobody'}</span>
+                    {who && (
+                      <>
+                        <span className="meta">{prettyModel(who.resolvedModel, who.model)}</span>
+                        <span className="meta" style={{ color: 'var(--faint)' }}>
+                          {who.effort ?? effortDefaultFor(who.role)}
+                        </span>
+                      </>
+                    )}
+                    <div style={{ flex: 1 }} />
+                    {s.passes > 1 && <Tag tone="warn">pass {s.passes}</Tag>}
+                    <span className="meta" style={{ color: 'var(--faint)' }}>
+                      {s.status}
+                    </span>
+                  </div>
+                  {/*
+                    The note explaining why this step exists was reachable only by hovering a dot
+                    and reading a native browser tooltip.
+                  */}
+                  {s.note && (
+                    <div className="meta selectable" style={{ paddingLeft: 13, lineHeight: 1.5 }}>
+                      {s.note}
+                    </div>
+                  )}
+                  {/*
+                    Model and effort are editable while the step has not started. Once it is
+                    running, changing them would say something the live process cannot hear.
+                  */}
+                  {who && s.status === 'pending' && (
+                    <div style={{ display: 'flex', gap: 6, paddingLeft: 13 }}>
+                      <Pick
+                        value={who.model}
+                        options={MODEL_OPTIONS.map((m) => ({ id: m.id, label: m.label }))}
+                        onPick={(id) =>
+                          void window.vibepilot.agents
+                            .update(projectId, who.id, { model: id })
+                            .then(load)
+                        }
+                      />
+                      <Pick
+                        value={who.effort ?? effortDefaultFor(who.role)}
+                        options={EFFORT_OPTIONS.map((e) => ({ id: e.id, label: e.label }))}
+                        onPick={(id) =>
+                          void window.vibepilot.agents
+                            .update(projectId, who.id, { effort: id as EffortLevel })
+                            .then(load)
+                        }
+                      />
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </Section>
+        )}
+
+        {/* The body: the Pilot's brief, accepted by the update IPC and read by nobody. */}
+        <Section
+          title="What this is"
+          action={
+            editing ? (
+              <div style={{ display: 'flex', gap: 5 }}>
+                <Button height={22} kind="primary" onClick={() => void save()}>
+                  Save
+                </Button>
+                <Button height={22} onClick={() => (setEditing(false), load())}>
+                  Cancel
+                </Button>
+              </div>
+            ) : (
+              <Button height={22} onClick={() => setEditing(true)}>
+                Edit
+              </Button>
+            )
+          }
+        >
+          {editing ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <Input value={title} onChange={setTitle} height={28} />
+              <textarea
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                rows={7}
+                placeholder="What needs doing, and anything the person doing it should know."
+                style={area}
+              />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                <span className="meta">budget $</span>
+                <Input value={budget} onChange={setBudget} height={24} placeholder={String(allowed)} />
+              </div>
+            </div>
+          ) : t.body.trim() ? (
+            <p className="selectable" style={{ ...para, whiteSpace: 'pre-wrap' }}>
+              {t.body}
+            </p>
+          ) : (
+            <p style={{ ...para, color: 'var(--faint)' }}>No description.</p>
+          )}
+        </Section>
+
+        {/*
+          From the diff, which is the only honest source. Teammates — the agents that edit files
+          — never persist their tool calls, and the Pilot, which does, cannot write files.
+        */}
+        {d.files.length > 0 && (
+          <Section title={`Files touched (${d.files.length})`}>
+            {d.files.map((f) => (
+              <div key={f.path} style={{ display: 'flex', gap: 7, alignItems: 'baseline' }}>
+                <span className="meta tnum" style={{ width: 12, flex: 'none' }}>
+                  {f.status}
+                </span>
+                <span className="mono ellip" style={{ fontSize: 11, flex: 1 }} title={f.path}>
+                  {f.path}
+                </span>
+              </div>
+            ))}
+          </Section>
+        )}
+
+        {/* Severity and summary already rendered on the card. The explanation did not. */}
+        {open.length > 0 && (
+          <Section title={`To fix (${open.length})`}>
+            {open.map((f) => (
+              <div key={f.id} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                  <Tag tone={f.severity === 'must' ? 'danger' : f.severity === 'should' ? 'warn' : 'neutral'}>
+                    {f.severity}
+                  </Tag>
+                  <span style={{ fontSize: 12, flex: 1 }}>{f.summary}</span>
+                  {f.file && (
+                    <span className="meta mono">
+                      {f.file.split(/[\\/]/).pop()}
+                      {f.line ? `:${f.line}` : ''}
+                    </span>
+                  )}
+                </div>
+                {f.detail && (
+                  <div className="meta selectable" style={{ lineHeight: 1.55 }}>
+                    {f.detail}
+                  </div>
+                )}
+              </div>
+            ))}
+          </Section>
+        )}
+
+        <Section title="Where it lives">
+          <KV k="Branch" v={t.branch ?? 'none yet'} />
+          <KV
+            k="Commits"
+            v={t.branch ? `${d.commitsAhead} ahead of ${baseBranch}` : '—'}
+          />
+          {t.worktreePath && (
+            <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
+              <span className="meta" style={{ width: 62, flex: 'none' }}>
+                Working copy
+              </span>
+              <span className="mono ellip selectable" style={{ flex: 1 }} title={t.worktreePath}>
+                {t.worktreePath}
+              </span>
+              <button
+                onClick={() => void window.vibepilot.system.revealInExplorer(t.worktreePath!)}
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  color: 'var(--muted)',
+                  font: '400 10.5px var(--font-heading)',
+                  textDecoration: 'underline',
+                  cursor: 'pointer',
+                }}
+              >
+                open
+              </button>
+            </div>
+          )}
+          {t.headSha && <KV k="Merged as" v={t.headSha.slice(0, 10)} />}
+        </Section>
+
+        {/*
+          What the TEAM spent. The Pilot's routing and briefing overhead is not attributable:
+          `pilot.ts` omits `ticket_id` from its usage_events insert entirely. Saying so is better
+          than quietly under-reporting a number people will compare against their bill.
+        */}
+        <Section title="Spent">
+          <div
+            style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}
+            title={
+              `${d.spend.turns} turn${d.spend.turns === 1 ? '' : 's'} by the team on this ticket.\n\n` +
+              `The Pilot's own turns are not counted here — its spend is not attributed to a ` +
+              `ticket, so this is what the people working it cost, not the whole story.`
+            }
+          >
+            <span className="tnum" style={{ fontSize: 13, fontWeight: 600 }}>
+              {formatTokens(tokens)} tok
+            </span>
+            <span className="meta tnum">
+              ${d.spend.costUsd.toFixed(2)} of ${allowed.toFixed(2)}
+            </span>
+            <div style={{ flex: 1 }} />
+            <span className="meta" style={{ color: 'var(--faint)' }}>
+              team only
+            </span>
+          </div>
+        </Section>
+      </div>
+    </aside>
+  )
+}
+
+const para: React.CSSProperties = { fontSize: 12.5, lineHeight: 1.6, color: 'var(--ink-2)', margin: 0 }
+
+const area: React.CSSProperties = {
+  width: '100%',
+  resize: 'vertical',
+  border: '1px solid var(--line)',
+  background: 'var(--paper)',
+  color: 'var(--ink)',
+  font: 'inherit',
+  fontSize: 12,
+  lineHeight: 1.6,
+  padding: 7,
+  outline: 'none',
+}
+
+function Section({
+  title,
+  action,
+  children,
+}: {
+  title: string
+  action?: React.ReactNode
+  children: React.ReactNode
+}) {
+  return (
+    <section style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span className="cap" style={{ flex: 1 }}>
+          {title}
+        </span>
+        {action}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+function KV({ k, v }: { k: string; v: string }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
+      <span className="meta" style={{ width: 62, flex: 'none' }}>
+        {k}
+      </span>
+      <span className="mono ellip selectable" style={{ flex: 1 }} title={v}>
+        {v}
+      </span>
+    </div>
+  )
+}
+
+/** A tiny inline dropdown, matching the one on the presentation card. */
+function Pick({
+  value,
+  options,
+  onPick,
+}: {
+  value: string
+  options: Array<{ id: string; label: string }>
+  onPick: (id: string) => void
+}) {
+  return (
+    <select
+      value={options.find((o) => o.id === value || o.label === value)?.id ?? ''}
+      onChange={(e) => onPick(e.target.value)}
+      style={{
+        height: 21,
+        border: '1px solid var(--line)',
+        background: 'var(--paper)',
+        color: 'var(--ink)',
+        font: '400 10.5px var(--font-heading)',
+        padding: '0 3px',
+        outline: 'none',
+      }}
+    >
+      {options.map((o) => (
+        <option key={o.id} value={o.id}>
+          {o.label}
+        </option>
+      ))}
+    </select>
+  )
+}
+
+/**
+ * The dev server for this ticket's worktree.
+ *
+ * *"i just when i asked him to change something i want that to appear locally you know?"* —
+ * this is that. It runs the project's own dev command in the worktree on its own port, so the
+ * change is visible without merging it and without touching the user's checkout.
+ */
+function PreviewPanel({ ticket }: { ticket: Ticket }) {
+  const [preview, setPreview] = useState<PreviewInfo | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const refresh = useCallback((): void => {
+    void window.vibepilot.preview.list(ticket.projectId).then((all) => {
+      setPreview(all.find((p) => p.ticketId === ticket.id) ?? null)
+    })
+  }, [ticket.projectId, ticket.id])
+
+  useEffect(() => {
+    refresh()
+    // The bus batches domain events; any of them may be the preview's own log line.
+    return window.vibepilot.bus.subscribe(() => refresh())
+  }, [refresh])
+
+  const start = async (): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    const res = await window.vibepilot.preview.start(ticket.id)
+    setBusy(false)
+    if (!res.ok) setError(res.reason ?? 'It would not start.')
+    else setPreview(res.preview ?? null)
+  }
+
+  return (
+    <Section title="Preview">
+      {preview ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <Tag tone="ok">running</Tag>
+            <button
+              onClick={() => void window.vibepilot.system.openExternal(preview.url)}
+              style={{
+                border: 'none',
+                background: 'transparent',
+                padding: 0,
+                color: 'var(--accent-ink)',
+                font: '500 12px var(--font-mono, monospace)',
+                cursor: 'pointer',
+                textDecoration: 'underline',
+              }}
+            >
+              {preview.url}
+            </button>
+            <div style={{ flex: 1 }} />
+            <Button height={22} onClick={() => void window.vibepilot.preview.stop(ticket.id)}>
+              Stop
+            </Button>
+          </div>
+          {preview.log && (
+            <pre
+              className="scroll-y selectable"
+              style={{
+                margin: 0,
+                maxHeight: 120,
+                padding: 7,
+                background: 'var(--color-neutral-100)',
+                border: '1px solid var(--line-2)',
+                font: '400 10.5px var(--font-mono, monospace)',
+                whiteSpace: 'pre-wrap',
+              }}
+            >
+              {preview.log}
+            </pre>
+          )}
+        </div>
+      ) : (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <Button height={22} kind="primary" disabled={busy} onClick={() => void start()}>
+            {busy ? 'Starting…' : 'Start preview'}
+          </Button>
+          <span className="meta">
+            Runs this branch on its own port. Your own checkout is not touched.
+          </span>
+          {error && (
+            <span className="meta" style={{ color: 'var(--danger)', width: '100%' }}>
+              {error}
+            </span>
+          )}
+        </div>
+      )}
+    </Section>
+  )
+}
