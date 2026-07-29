@@ -1,0 +1,466 @@
+import type { Ticket, TicketRoute } from '@shared/types'
+import { activeStep } from '@shared/types'
+import { bus } from '../bus'
+import { getAgent, setAgentStatus } from '../db/repos/agents'
+import { addMessage, getQuestion } from '../db/repos/messages'
+import { getProject, listProjects } from '../db/repos/projects'
+import { acceptedRoute, assignStep } from '../db/repos/routes'
+import { getTicket, listTickets } from '../db/repos/tickets'
+import { flushWrites } from '../db/writer'
+import { notifyUser } from '../notify'
+import * as gate from './gate'
+import { manager } from './manager'
+import { pilot } from './pilot'
+import { launchTeammate } from './teammate'
+
+/**
+ * Putting work back on its feet.
+ *
+ * A route step says `active`, a teammate is assigned to it, and **nothing is running**. The
+ * board shows the ticket sitting there; the message log's last line is an error from twenty
+ * minutes ago; the Pilot says "restarted it" and it stalls again. Watching that happen is what
+ * this file is for: *"if this is detected it needs to fire a fix of some sort."*
+ *
+ * Two causes were confirmed in real use, and they want the same remedy:
+ *
+ *   1. **The launch itself failed.** Before 0.3.1, `launchTeammate` read `mcpServer.url`
+ *      without ever starting the server, so every path except "the Pilot went first" threw.
+ *      The step stayed `active` for ever because nothing walks routes looking for orphans.
+ *   2. **The model call failed.** Rate limits on the big model, mid-run. Transient, clears on
+ *      its own, and the only correct response is to try again a few minutes later.
+ *
+ * The remedy is a **resume**, not a fresh start: the session id and the worktree have been
+ * persisted since the process layer was built precisely so a restart carries on rather than
+ * re-reading the codebase and redoing committed work.
+ *
+ * What this file deliberately does not do: retry for ever. One automatic attempt per teammate
+ * per app run, then it becomes something the user is told about. A loop that keeps relaunching
+ * a genuinely broken step burns the rate limit it is usually waiting on.
+ */
+
+/** How long a step may sit `active` with nothing behind it before it counts as stuck. */
+export const STUCK_GRACE_MS = 5 * 60_000
+
+export interface StuckStep {
+  ticket: Ticket
+  /** Null when the step has nobody on it at all — see `carryForward`. */
+  agentId: string | null
+  agentName: string | null
+  /** The step, so an unassigned one can be assigned rather than only reported. */
+  stepId: string
+  stepKind: string
+  /** The brief the step was launched with, so a resume lands in the same job. */
+  brief: string | null
+  /** What the agent's status line said, or why the board calls it stuck. */
+  said: string | null
+}
+
+/**
+ * Who should pick up a step that has nobody on it.
+ *
+ * Not a judgement — both candidates are already recorded, and both are the answer the app
+ * gives elsewhere. The person who finished the previous step is the one the route cards mean
+ * by *"same agent carries the approved plan into the build, no cold start"*; the ticket's own
+ * assignee is who the board has been showing all along. If neither exists, this returns null
+ * and a person is asked, because inventing an assignee is exactly the kind of guess that ends
+ * with the wrong teammate rewriting somebody else's work.
+ */
+function carryForward(ticket: Ticket, route: TicketRoute): string | null {
+  const done = [...route.steps].reverse().find((x) => x.status === 'done' && x.assigneeAgentId)
+  for (const id of [done?.assigneeAgentId, ticket.assigneeAgentId]) {
+    if (!id) continue
+    const who = getAgent(id)
+    if (who && who.projectId === ticket.projectId) return who.id
+  }
+  return null
+}
+
+/**
+ * Steps that claim to be running and are not.
+ *
+ * Deliberately **not** a status allowlist. The obvious version checks for `error` or
+ * `stalled`, and misses the case that produced this file: a step activated by `advance_step`
+ * whose launch never happened at all, whose agent still reads `idle` or `done` from the step it
+ * finished ten minutes ago. Absence of a process is the fact; the status is commentary on it.
+ *
+ * The grace period is what keeps a launch that is merely *slow* out of this list — a spawn
+ * takes seconds, and `queued` is checked separately because the gate holding work back is the
+ * cap doing its job, not a fault.
+ */
+export function detectStuckSteps(projectId: string, now = Date.now()): StuckStep[] {
+  const out: StuckStep[] = []
+
+  for (const ticket of listTickets(projectId)) {
+    if (ticket.lane === 'done' || ticket.readyToMerge) continue
+    const route = acceptedRoute(ticket.id)
+    const step = activeStep(route)
+    if (!step || !route) continue
+
+    /*
+     * A step that is active with nobody on it.
+     *
+     * This was skipped outright — the loop required an assignee, on the reasoning that there
+     * is nobody to restart. True, and it left the board saying "1 ticket is stuck, nobody is
+     * actually working on it" beside a row of idle teammates, with nothing anywhere able to
+     * change that. `derivePlacement` has always called this stuck; it needed *assigning*, not
+     * restarting, and the candidate is already recorded.
+     */
+    if (!step.assigneeAgentId) {
+      // Nothing has run yet on this route: that is "waiting to be picked up", not a stall.
+      if (!route.steps.some((x) => x.status === 'done' || x.status === 'rework')) continue
+      out.push({
+        ticket,
+        agentId: null,
+        agentName: null,
+        stepId: step.id,
+        stepKind: step.kind,
+        brief: step.brief,
+        said: `${step.kind} has nobody assigned, and the work before it is done.`,
+      })
+      continue
+    }
+
+    const who = getAgent(step.assigneeAgentId)
+    if (!who) continue
+
+    // Running, or about to be. Neither is stuck.
+    if (manager.forAgent(who.id)) continue
+    if (gate.isQueued(who.id)) continue
+
+    // Give a launch time to actually happen before calling it a failure.
+    if (now - who.updatedAt < STUCK_GRACE_MS) continue
+
+    out.push({
+      ticket,
+      agentId: who.id,
+      agentName: who.name,
+      stepId: step.id,
+      stepKind: step.kind,
+      brief: step.brief,
+      said: who.statusLine,
+    })
+  }
+
+  return out
+}
+
+/**
+ * Start a teammate again on a ticket, resuming its session.
+ *
+ * Shared by the heartbeat, the Pilot's `restart_step` tool and the restart button, so the
+ * three cannot drift apart. The ticket is a **parameter** rather than something this looks up:
+ * the heartbeat already knows exactly which ticket the orphaned step belongs to, and searching
+ * for "a ticket this agent is assigned to" can find a stale one from a previous job.
+ */
+export function relaunchAssignee(input: {
+  agentId: string
+  ticketId: string
+  brief?: string | null
+  /** What to show on the agent card while it waits for a slot. */
+  because: string
+  pilotAgentId?: string
+}): boolean {
+  const who = getAgent(input.agentId)
+  const ticket = getTicket(input.ticketId)
+  if (!who || !ticket) return false
+
+  setAgentStatus(who.id, 'queued', input.because)
+  flushWrites()
+  bus.emitDomain({ type: 'agents:changed', projectId: who.projectId })
+
+  gate.submit({
+    projectId: who.projectId,
+    agentId: who.id,
+    run: () =>
+      launchTeammate({
+        projectId: who.projectId,
+        agentId: who.id,
+        name: who.name,
+        role: who.role,
+        provider: who.provider,
+        model: who.model,
+        ticketId: ticket.id,
+        brief:
+          input.brief ??
+          `Carry on with #${ticket.number}: ${ticket.title}. Check what you have already ` +
+            `done before redoing any of it.`,
+        pilotAgentId: input.pilotAgentId ?? '',
+        /*
+         * The whole point. A cold start re-reads the codebase and repeats work already
+         * sitting committed in the worktree.
+         */
+        resumeSessionId: who.sessionId,
+      }).catch((e: Error) => {
+        /*
+         * Without this the rejection is unhandled — `gate.begin` does `void run()` — and the
+         * agent freezes at `queued` for ever, which is worse than the failure it is hiding:
+         * `queued` reads as "waiting for a slot" everywhere, including to this file's own
+         * detector, so nothing ever looks at it again.
+         */
+        setAgentStatus(who.id, 'error', e.message.slice(0, 120))
+        bus.emitDomain({ type: 'agents:changed', projectId: who.projectId })
+      }),
+  })
+
+  return true
+}
+
+/**
+ * One automatic attempt per teammate per app run.
+ *
+ * Cleared when that teammate completes a run (`startHeartbeat` subscribes), so an agent that
+ * worked for two hours and then stalled earns a fresh attempt, while heal → immediate crash
+ * escalates instead of looping.
+ */
+const attempts = new Map<string, number>()
+
+export function clearHealAttempts(agentId: string): void {
+  attempts.delete(agentId)
+}
+
+/** Test seam — the module keeps state for the life of the process. */
+export function resetHealState(): void {
+  attempts.clear()
+  escalated.clear()
+}
+
+const escalated = new Set<string>()
+
+/**
+ * Find stuck steps and do something about them.
+ *
+ * Returns the tickets it acted on, so the caller can say so. `autoStart: 'never'` means the
+ * user asked to press the button themselves — relaunching for them would be exactly the
+ * surprise that setting exists to prevent, so those projects only ever get the report, which
+ * surfaces in the Needs-you popover.
+ */
+export function healStuckSteps(
+  projectId: string,
+  relaunch: typeof relaunchAssignee = relaunchAssignee,
+  now = Date.now(),
+): number[] {
+  const project = getProject(projectId)
+  if (!project) return []
+
+  const healed: number[] = []
+
+  for (const stuck of detectStuckSteps(projectId, now)) {
+    /*
+     * Nobody on it. Put the obvious person on it, then treat it as a normal launch.
+     *
+     * Keyed on the ticket rather than an agent, because there is no agent yet — and a failed
+     * assignment must not get a second free go every three minutes for the same reason a
+     * failed restart does not.
+     */
+    if (!stuck.agentId) {
+      const key = `assign:${stuck.ticket.id}`
+      const tried = attempts.get(key) ?? 0
+      const route = acceptedRoute(stuck.ticket.id)
+      const candidate = route ? carryForward(stuck.ticket, route) : null
+
+      if (tried >= 1 || !candidate || project.autoStart === 'never') {
+        escalate(projectId, stuck, project.autoStart === 'never' || !candidate)
+        continue
+      }
+
+      attempts.set(key, tried + 1)
+      assignStep(stuck.ticket.id, stuck.stepId, candidate)
+      flushWrites()
+
+      if (!relaunch({
+        agentId: candidate,
+        ticketId: stuck.ticket.id,
+        brief: stuck.brief,
+        because: `Starting #${stuck.ticket.number}`,
+      })) {
+        continue
+      }
+
+      addMessage({
+        projectId,
+        agentId: null,
+        authorType: 'system',
+        kind: 'notice',
+        body:
+          `#${stuck.ticket.number}: the ${stuck.stepKind} step had nobody on it and the work ` +
+          `before it was done. ${getAgent(candidate)?.name ?? 'Someone'} carried on with it — ` +
+          `they did the step before, so nothing is re-read from scratch.`,
+      })
+      healed.push(stuck.ticket.number)
+      continue
+    }
+
+    const tries = attempts.get(stuck.agentId) ?? 0
+
+    if (tries >= 1 || project.autoStart === 'never') {
+      escalate(projectId, stuck, project.autoStart === 'never')
+      continue
+    }
+
+    attempts.set(stuck.agentId, tries + 1)
+    if (!relaunch({
+      agentId: stuck.agentId,
+      ticketId: stuck.ticket.id,
+      brief: stuck.brief,
+      because: `Restarting #${stuck.ticket.number}`,
+    })) {
+      continue
+    }
+
+    addMessage({
+      projectId,
+      agentId: null,
+      authorType: 'system',
+      kind: 'notice',
+      body:
+        `#${stuck.ticket.number}: ${stuck.agentName} had stopped` +
+        (stuck.said ? ` (${stuck.said})` : '') +
+        ` — restarted automatically, resuming where it left off. Nothing was lost.`,
+    })
+    healed.push(stuck.ticket.number)
+  }
+
+  if (healed.length > 0) {
+    flushWrites()
+    bus.emitDomain({ type: 'messages:changed', projectId })
+    bus.emitDomain({ type: 'agents:changed', projectId })
+  }
+
+  return healed
+}
+
+/**
+ * Out of automatic options — say so, once, everywhere that survives a dead Pilot.
+ *
+ * `notifyUser` and the message row both work with no Pilot process; `pilot.notify` is a
+ * best-effort extra. That ordering matters: the failure this handles is frequently *why* the
+ * Pilot is not running.
+ */
+function escalate(projectId: string, stuck: StuckStep, manualOnly: boolean): void {
+  const key = `${stuck.agentId ?? 'unassigned'}:${stuck.ticket.id}`
+  if (escalated.has(key)) return
+  escalated.add(key)
+
+  const why = !stuck.agentId
+    ? `#${stuck.ticket.number} has reached its ${stuck.stepKind} step with nobody on it, and ` +
+      `vibePilot could not work out who should carry it on. Put somebody on it from the ` +
+      `ticket, or tell the Pilot to.`
+    : manualOnly
+      ? `#${stuck.ticket.number} is assigned to ${stuck.agentName} but nothing is running it. ` +
+        `This project starts work only when you say so, so it is waiting for you.`
+      : `#${stuck.ticket.number} stopped again after being restarted automatically` +
+        (stuck.said ? ` — ${stuck.said}` : '') +
+        `. It needs you now: restart it from the agents panel, or hand the step to someone else.`
+
+  addMessage({
+    projectId,
+    agentId: null,
+    authorType: 'system',
+    kind: manualOnly ? 'notice' : 'error',
+    body: why,
+  })
+  flushWrites()
+  bus.emitDomain({ type: 'messages:changed', projectId })
+
+  if (!manualOnly) {
+    notifyUser({
+      projectId,
+      title: `#${stuck.ticket.number} is stuck`,
+      body: stuck.agentName
+        ? `${stuck.agentName} stopped twice. ${stuck.ticket.title}`
+        : `Nobody is on it. ${stuck.ticket.title}`,
+    })
+    pilot.notify(projectId, why)
+  }
+}
+
+/**
+ * You answered, and nothing woke up.
+ *
+ * The exact sequence, after the machine came back from hibernation: the soft timeout inside
+ * `ask_user` had fired while the lid was shut (Windows fires an overdue timer immediately on
+ * resume), so the waiter was gone. The agent was supposed to call `await_answer` to keep
+ * waiting — but its connection to the model had died with the sleep, so that turn never
+ * happened. The question stayed open, the card stayed on screen with working buttons, and
+ * answering it wrote the answer to the database where nobody was left to read it.
+ *
+ * `askUserGate.wait` already handles the other half of this — *"already answered while we were
+ * away (e.g. the process restarted)"* — so the only missing piece was something to restart it.
+ *
+ * Returns whether it started anything.
+ */
+export function wakeAsker(questionId: string): boolean {
+  const q = getQuestion(questionId)
+  if (!q) return false
+
+  const who = getAgent(q.agentId)
+  if (!who) return false
+
+  // Running or queued: it will pick the answer up itself. Restarting would take the process
+  // away from a turn that is mid-flight.
+  if (manager.forAgent(who.id) || gate.isQueued(who.id)) return false
+
+  /*
+   * The Pilot is not a teammate and has no ticket — it is woken through its own path, which
+   * knows how to resume its session and does not go through the concurrency gate.
+   */
+  if (who.isPilot) {
+    void pilot
+      .ensure(q.projectId, who.model)
+      .then(() =>
+        pilot.notify(
+          q.projectId,
+          `The user answered the question you were waiting on. Call \`await_answer\` with ` +
+            `question_id ${q.id} to collect it, then carry on.`,
+        ),
+      )
+      .catch(() => undefined)
+    return true
+  }
+
+  const ticketId = q.ticketId ?? listTickets(q.projectId).find((t) => t.assigneeAgentId === who.id)?.id
+  if (!ticketId) return false
+
+  const started = relaunchAssignee({
+    agentId: who.id,
+    ticketId,
+    brief:
+      `You asked: "${q.question}"\n\nThe user has answered it. Call \`await_answer\` with ` +
+      `question_id ${q.id} to read the answer, then carry on with what you were doing. ` +
+      `Check what you had already done before redoing any of it.`,
+    because: 'Picking your answer up',
+  })
+
+  if (started) {
+    addMessage({
+      projectId: q.projectId,
+      agentId: null,
+      authorType: 'system',
+      kind: 'notice',
+      body:
+        `${who.name} had stopped while waiting for your answer — started again to pick it up. ` +
+        `Nothing it had already done is redone.`,
+    })
+    flushWrites()
+    bus.emitDomain({ type: 'messages:changed', projectId: q.projectId })
+  }
+
+  return started
+}
+
+/**
+ * The machine woke up.
+ *
+ * Hibernation is not a failure, but it looks exactly like one from in here: connections to the
+ * model are gone, timers that were due fire all at once, and processes that Windows preserved
+ * are holding sockets that will never answer again. The heartbeat would find most of this
+ * eventually — up to three minutes later, and only once per teammate per app run.
+ *
+ * So: check immediately, and give everything a fresh attempt. A stall caused by the lid
+ * closing is a new situation, not the same failure repeating, and spending a teammate's only
+ * automatic restart on it would leave the rest of the day unprotected.
+ */
+export function onSystemResume(): void {
+  resetHealState()
+  for (const project of listProjects()) healStuckSteps(project.id)
+}
