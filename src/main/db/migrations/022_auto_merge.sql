@@ -1,0 +1,29 @@
+-- Finished work lands on its own.
+--
+-- Plan 23 put merging on the always-stops list, reasoning that it is "the one place work
+-- becomes real". Using the app showed that reasoning to be wrong in a specific way: a chain of
+-- finished tickets turned into a queue of merge buttons, each blocked by the one above it, and
+-- the whole thing jammed on unsaved work that turned out to be vibePilot's own memory folder.
+-- The autonomy the app was built for evaporated into "waiting for you, waiting for you".
+--
+-- The honest gates are further along than merge:
+--
+--   push    the work leaves this machine        -> still a button
+--   deploy  the work reaches other people       -> still a button, still confirms
+--
+-- A local squash-merge is none of those. It is inspectable (`git show`), revertable
+-- (`git reset --hard @{1}`), and announced in the message log every single time. So it can be
+-- automatic, and the always-stops list is revised to name the two that actually matter.
+--
+--   off       every merge waits for the button. What the app did before this.
+--   green     merge when the route is complete AND the configured checks passed. The default.
+--   always    merge when the route is complete, checks or no checks. For projects with none.
+--
+-- Conflicts always stop. A branch with nothing on it always stops. The user's own uncommitted
+-- work always stops. None of those are things a machine should decide.
+--
+-- `green` for new projects AND for existing ones. This is a deliberate exception to the
+-- otherwise-strict rule that an upgrade changes nothing: it is the behaviour that was asked
+-- for, in as many words, and migration 020's machine-owned handling removes the failure mode
+-- that made unattended merging unwise. The release note says so plainly.
+ALTER TABLE projects ADD COLUMN auto_merge TEXT NOT NULL DEFAULT 'green';
