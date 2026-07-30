@@ -1,0 +1,20 @@
+-- One press, not two.
+--
+-- Making a ticket happen took two approvals in two places: accept the draft, then find the
+-- route card that appeared somewhere else and press Start. Both were deliberate, and together
+-- they are the bureaucracy the app was supposed to remove — *"1st the step of creating the
+-- ticket then the step of accepting and launching the ticket. this needs to be improved."*
+--
+-- The machinery to collapse them already exists: accepting a draft nudges the Pilot to route
+-- it, and `propose_route` calls `maybeAutoStart`. What stopped it was `auto_start` defaulting
+-- to `never`, chosen in migration 019 so that upgrading changed nothing.
+--
+-- That caution has been answered directly and more than once — "no more approving", "I don't
+-- want to press any buttons", "I have this app so it doesn't slow me down". So the default
+-- becomes `simple`: a one-step route with a named assignee starts by itself. Anything longer,
+-- anything with a reviewer, and anything the Pilot flagged as uncertain still waits.
+--
+-- Only rows still holding the old default are moved. Anyone who has deliberately chosen
+-- `never` or `always` keeps their choice — an upgrade may change a default, but never a
+-- decision somebody made.
+UPDATE projects SET auto_start = 'simple' WHERE auto_start = 'never';
