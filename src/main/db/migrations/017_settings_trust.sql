@@ -1,0 +1,18 @@
+-- Whether this project's own `.claude/settings.json` may be honoured.
+--
+-- vibePilot spawns the CLI with `--permission-mode bypassPermissions`, and it was also passing
+-- `--setting-sources project` unconditionally. Together those mean a project folder's settings —
+-- including SessionStart and PostToolUse hooks, which shell out to arbitrary commands — ran at
+-- spawn with no prompt and no model in the loop. Adding a cloned repository was enough.
+--
+-- The irony was that the global `~/.claude/settings.json` was deliberately excluded for exactly
+-- this reason. But a project directory is the *less* trustworthy of the two: your own global
+-- config is yours, whereas a repository is usually somebody else's code.
+--
+-- Interactive Claude Code gets this right by showing a trust dialog the first time you open a
+-- folder. Headless `-p` never shows one, so vibePilot has to be the gate itself.
+--
+-- Defaults to 0 — not trusted — including for projects added before this migration. Turning it
+-- on is a deliberate act, and the only thing lost while it is off is a project's own custom
+-- Claude configuration, which most projects do not have.
+ALTER TABLE projects ADD COLUMN settings_trusted INTEGER NOT NULL DEFAULT 0;

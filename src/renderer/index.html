@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- CSP is set as a response header in src/main/index.ts, not here: a meta tag can't be
+         relaxed for Vite's dev-mode inline preamble without also weakening the shipped app. -->
+    <title>vibePilot</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
