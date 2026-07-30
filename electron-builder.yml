@@ -1,0 +1,58 @@
+appId: net.peggert.vibepilot
+productName: vibePilot
+copyright: © peggert
+
+directories:
+  buildResources: build
+  output: dist
+
+# `out/` is everything electron-vite produced; package.json is needed for the app name and
+# version at runtime. Nothing else from the repo ships — no source, no tests, no plans.
+files:
+  - out/**/*
+  - package.json
+
+# The window icon is read from `process.resourcesPath` once packaged. Without this it is only
+# ever found in dev, and the shipped app quietly falls back to Electron's own icon.
+extraResources:
+  - from: build/icon.png
+    to: icon.png
+
+win:
+  icon: build/icon.ico
+  # An installer people recognise, plus a portable exe for "just try it, do not install
+  # anything". Portable is the one to send someone.
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+
+nsis:
+  # Per-user, so no admin prompt. An orchestrator that demands elevation to install is asking
+  # for a trust it does not need.
+  perMachine: false
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: vibePilot
+  # Keep the database and worktrees on uninstall. They are the user's work, not ours.
+  deleteAppDataOnUninstall: false
+
+portable:
+  artifactName: vibePilot-${version}-portable.exe
+
+# Where updates come from.
+#
+# A **separate, public** repository holding nothing but installers and `latest.yml`. The source
+# lives in the private `vibepilot` repo and stays there.
+#
+# The split is the whole point: electron-updater fetches the manifest anonymously, so a private
+# host would mean shipping a GitHub token inside the .exe — handing anyone who has the app a
+# credential with access to every repository on the account. A public bucket of build outputs
+# costs nothing and leaks nothing.
+publish:
+  - provider: github
+    owner: peggertwizard
+    repo: vibepilot-agent-orchestrator
