@@ -1,0 +1,472 @@
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { closeDb, openDb } from '../src/main/db'
+import { bus } from '../src/main/bus'
+import { installTelemetry } from '../src/main/engine/telemetry'
+import { flushWrites } from '../src/main/db/writer'
+import { addProject, updateProject } from '../src/main/db/repos/projects'
+import { createAgent, getAgent, setAgentSession, setAgentStatus } from '../src/main/db/repos/agents'
+import { archiveTicket, createTicket } from '../src/main/db/repos/tickets'
+import { addQuestion, answerQuestion, listMessages } from '../src/main/db/repos/messages'
+import { acceptRoute, acceptedRoute, completeActiveStep, proposeRoute } from '../src/main/db/repos/routes'
+import { activeStep } from '../src/shared/types'
+import {
+  STUCK_GRACE_MS,
+  detectStuckSteps,
+  HEAL_COOLDOWN_MS,
+  healStuckSteps,
+  settleAgentsOnBoot,
+  resetHealState,
+  wakeAsker,
+} from '../src/main/engine/heal'
+
+/**
+ * Work that stopped, and nothing noticed.
+ *
+ * The shape from the screenshots: a route step says `active`, a teammate is assigned to it,
+ * and there is no process anywhere. Both causes seen in real use land here — a launch that
+ * threw before the process existed, and a model call that failed mid-run — and the app's
+ * answer to both was to draw a card and wait for a human to spot it.
+ *
+ * These tests never spawn anything. `manager.forAgent` is empty in a test process by
+ * construction, which is exactly the condition under test, and the relaunch is injected so the
+ * decision can be asserted without a Claude process.
+ */
+
+let projectId: string
+
+beforeAll(() => {
+  openDb(join(mkdtempSync(join(tmpdir(), 'vp-db-')), 'test.db'))
+  const repo = mkdtempSync(join(tmpdir(), 'vp-repo-'))
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo })
+  projectId = addProject({ path: repo, name: 'Heal' }).id
+})
+
+afterAll(() => {
+  flushWrites()
+  closeDb()
+})
+
+beforeEach(() => resetHealState())
+
+/** A ticket with an accepted single-step route, assigned, and nothing running it. */
+function stalledTicket(title: string): { ticketId: string; agentId: string; number: number } {
+  const who = createAgent({
+    projectId,
+    name: `Dev ${title}`,
+    role: 'builder',
+    provider: 'claude',
+    model: 'sonnet',
+    isPilot: false,
+    ephemeral: false,
+    status: 'error',
+  })
+  const t = createTicket({ projectId, title, body: '', lane: 'todo' })
+  const r = proposeRoute({
+    projectId,
+    ticketId: t.id,
+    proposedByAgentId: null,
+    rationale: '',
+    steps: [{ kind: 'build', assigneeAgentId: who.id }],
+  })
+  acceptRoute(r.id, [{ kind: 'build', assigneeAgentId: who.id }])
+  setAgentStatus(who.id, 'error', 'The model call failed.')
+  flushWrites()
+  return { ticketId: t.id, agentId: who.id, number: t.number }
+}
+
+/** Far enough in the future that the grace period has passed. */
+const later = (): number => Date.now() + STUCK_GRACE_MS + 1_000
+
+describe('a transient failure is retried, not abandoned', () => {
+  /**
+   * "The model call failed" is usually a rate limit: it clears on its own, and the design note
+   * has always said the heartbeat tick is the backoff. But heal allowed ONE attempt per agent
+   * per app run — so the first relaunch to hit the limit burned it, and the ticket then sat
+   * "in progress" with an errored agent, an idle roster, and nothing anywhere that would ever
+   * try again until the app restarted. Seen live on #5.
+   */
+  it('tries again after the cooldown instead of never', () => {
+    const { agentId, number } = stalledTicket('Rate limited')
+    const calls: string[] = []
+    const fakeRelaunch = (i: { agentId: string }) => (calls.push(i.agentId), true)
+
+    const t0 = later()
+    expect(healStuckSteps(projectId, fakeRelaunch as never, t0)).toContain(number)
+    // Immediately after: inside the cooldown, so escalate rather than hammer.
+    expect(healStuckSteps(projectId, fakeRelaunch as never, t0 + 1_000)).not.toContain(number)
+    // After the cooldown: the limit may have cleared, so it is worth one more spawn.
+    expect(
+      healStuckSteps(projectId, fakeRelaunch as never, t0 + HEAL_COOLDOWN_MS + 1_000),
+    ).toContain(number)
+    expect(calls).toEqual([agentId, agentId])
+  })
+})
+
+describe('noticing that nothing is running', () => {
+  it('finds a step that claims to be active with no process behind it', () => {
+    const { number } = stalledTicket('Stalled')
+    const found = detectStuckSteps(projectId, later())
+    expect(found.map((s) => s.ticket.number)).toContain(number)
+  })
+
+  /*
+   * The obvious implementation filters on `status === 'error' || 'stalled'` and misses the
+   * case that produced this file: a step activated by `advance_step` whose launch never
+   * happened, whose agent still reads `idle` from the step it finished. Absence of a process
+   * is the fact; the status is commentary on it.
+   */
+  it('counts an idle-looking agent on an active step as stuck', () => {
+    const { agentId, number } = stalledTicket('Looks fine')
+    setAgentStatus(agentId, 'idle', null)
+    flushWrites()
+    expect(detectStuckSteps(projectId, later()).map((s) => s.ticket.number)).toContain(number)
+  })
+
+  /*
+   * The restart screenshot: "Interrupted when vibePilot closed", a Restart button, and work
+   * the user had already answered questions for sitting still.
+   *
+   * `stalled` is written by one thing — `markAllStalledOnBoot` — and it means definitively
+   * dead: a child's stdio cannot be reattached once the parent exits. There is no slow launch
+   * to wait for. Worse, that function stamps `updated_at = now()`, so the grace period
+   * restarted at boot and the first heartbeat tick was still inside it.
+   */
+  it('does not make interrupted work sit out the grace period', () => {
+    const { agentId, number } = stalledTicket('Interrupted')
+    setAgentStatus(agentId, 'stalled', 'Interrupted when vibePilot closed')
+    flushWrites()
+    // Now, not later: this is the moment just after boot.
+    expect(detectStuckSteps(projectId, Date.now()).map((s) => s.ticket.number)).toContain(number)
+  })
+
+  it('leaves a launch that is merely young alone', () => {
+    const { number } = stalledTicket('Just started')
+    // Now, not later: the row was touched moments ago and a spawn takes seconds.
+    expect(detectStuckSteps(projectId, Date.now()).map((s) => s.ticket.number)).not.toContain(
+      number,
+    )
+  })
+})
+
+describe('a step with nobody on it', () => {
+  /*
+   * The screenshot that reopened this: *"1 ticket is stuck — nobody is actually working on
+   * it"* beside a rail of idle teammates. `advance_step` had activated a step carrying no
+   * assignee, `derivePlacement` correctly called it stuck, and nothing anywhere could act:
+   * heal required an assignee, on the reasoning that there is nobody to restart. True, and
+   * useless — it needed assigning.
+   */
+  const halfDone = (title: string): { ticketId: string; agentId: string; number: number } => {
+    const who = createAgent({
+      projectId,
+      name: `Planner ${title}`,
+      role: 'builder',
+      provider: 'claude',
+      model: 'sonnet',
+      isPilot: false,
+      ephemeral: false,
+      status: 'idle',
+    })
+    const t = createTicket({ projectId, title, body: '', lane: 'todo' })
+    const r = proposeRoute({
+      projectId,
+      ticketId: t.id,
+      proposedByAgentId: null,
+      rationale: '',
+      steps: [
+        { kind: 'plan', assigneeAgentId: who.id },
+        { kind: 'build', assigneeAgentId: null },
+      ],
+    })
+    const accepted = acceptRoute(r.id, [
+      { kind: 'plan', assigneeAgentId: who.id },
+      { kind: 'build', assigneeAgentId: null },
+    ])!
+    // Finish the plan, which activates a build nobody is on.
+    completeActiveStep(t.id)
+    flushWrites()
+    void accepted
+    return { ticketId: t.id, agentId: who.id, number: t.number }
+  }
+
+  it('is detected, even though there is nobody to restart', () => {
+    const { number } = halfDone('Unassigned build')
+    const found = detectStuckSteps(projectId, later())
+    const mine = found.find((f) => f.ticket.number === number)
+    expect(mine).toBeTruthy()
+    expect(mine?.agentId).toBeNull()
+  })
+
+  it('carries the previous step forward instead of asking', () => {
+    const { ticketId, agentId, number } = halfDone('Carry me')
+    const calls: Array<{ agentId: string; ticketId: string }> = []
+    const healed = healStuckSteps(
+      projectId,
+      (i) => (i.ticketId === ticketId && calls.push({ agentId: i.agentId, ticketId: i.ticketId }), true),
+      later(),
+    )
+
+    expect(healed).toContain(number)
+    // The person who wrote the plan is the one who should build from it — the route cards
+    // already promise exactly that, and it avoids a cold re-read of everything.
+    expect(calls[0]?.agentId).toBe(agentId)
+    expect(activeStep(acceptedRoute(ticketId))?.assigneeAgentId).toBe(agentId)
+  })
+
+  /**
+   * The commonest stall of all, and the detector was blind to it by construction.
+   *
+   * The old rule exempted any route with no finished step — "nobody has started it, so it is
+   * waiting to be picked up". Permanently. A single-build route has no earlier step that could
+   * ever finish, and most routes are single-build, so an accepted route whose one step never
+   * got an assignee could never be seen. Found in a real project as
+   * `#1 [todo] build:active(NOBODY)`, sitting in To do beside a row of idle teammates.
+   */
+  it('finds an accepted route whose first step never got anybody', () => {
+    const t = createTicket({ projectId, title: 'Never begun', body: '', lane: 'todo' })
+    const r = proposeRoute({
+      projectId, ticketId: t.id, proposedByAgentId: null, rationale: '',
+      steps: [{ kind: 'build', assigneeAgentId: null }],
+    })
+    acceptRoute(r.id, [{ kind: 'build', assigneeAgentId: null }])
+    flushWrites()
+    expect(detectStuckSteps(projectId, later()).map((f) => f.ticket.number)).toContain(t.number)
+  })
+
+  it('leaves a route alone while it is still within the grace period', () => {
+    const who = createAgent({
+      projectId, name: 'Idle hand', role: 'builder', provider: 'claude', model: 'sonnet',
+      isPilot: false, ephemeral: false, status: 'idle',
+    })
+    const t = createTicket({ projectId, title: 'Not begun', body: '', lane: 'todo' })
+    const r = proposeRoute({
+      projectId, ticketId: t.id, proposedByAgentId: null, rationale: '',
+      steps: [{ kind: 'build', assigneeAgentId: null }],
+    })
+    acceptRoute(r.id, [{ kind: 'build', assigneeAgentId: null }])
+    flushWrites()
+    void who
+    // Just accepted — a launch is allowed time to actually happen before it counts as a stall.
+    expect(detectStuckSteps(projectId, Date.now()).map((f) => f.ticket.number)).not.toContain(t.number)
+  })
+})
+
+describe('doing something about it', () => {
+  it('restarts once and says so in the log', () => {
+    const { ticketId, number } = stalledTicket('Restart me')
+    const calls: string[] = []
+    const healed = healStuckSteps(projectId, (i) => (calls.push(i.ticketId), true), later())
+
+    expect(healed).toContain(number)
+    expect(calls).toContain(ticketId)
+    const said = listMessages(projectId).map((m) => m.body).join('\n')
+    expect(said).toContain(`#${number}`)
+    expect(said).toContain('restarted automatically')
+  })
+
+  /*
+   * The failure mode this guards is worse than the one it fixes: a relaunch loop against a
+   * step that is broken for a reason no restart can address burns the rate limit it is
+   * usually waiting on, every three minutes, silently.
+   */
+  it('does not restart the same teammate twice', () => {
+    const { ticketId, number } = stalledTicket('Twice')
+    // Filtered to this ticket: every earlier case in this file left a stalled ticket behind,
+    // and they are all legitimately healable on a fresh pass.
+    const mine: string[] = []
+    const record = (i: { ticketId: string }): boolean => (
+      i.ticketId === ticketId && mine.push(i.ticketId), true
+    )
+    healStuckSteps(projectId, record, later())
+    const second = healStuckSteps(projectId, record, later())
+
+    expect(second).not.toContain(number)
+    expect(mine).toHaveLength(1)
+  })
+
+  it('escalates on the second pass instead of retrying', () => {
+    const { number } = stalledTicket('Escalate')
+    healStuckSteps(projectId, () => true, later())
+    healStuckSteps(projectId, () => true, later())
+
+    const errors = listMessages(projectId).filter((m) => m.kind === 'error')
+    expect(errors.some((m) => m.body.includes(`#${number}`))).toBe(true)
+    expect(errors.some((m) => m.body.includes('needs you'))).toBe(true)
+  })
+
+  /*
+   * "Ask me first" has to mean it. A project that never starts work by itself must not start
+   * work by itself because something broke — that is precisely the surprise the setting exists
+   * to prevent, so it gets the report and nothing else.
+   */
+  it('never starts anything on a project set to ask first', () => {
+    updateProject(projectId, { autoStart: 'never' })
+    flushWrites()
+    const { number } = stalledTicket('Manual only')
+    const calls: string[] = []
+    const healed = healStuckSteps(projectId, (i) => (calls.push(i.ticketId), true), later())
+
+    expect(healed).toEqual([])
+    expect(calls).toEqual([])
+    expect(listMessages(projectId).some((m) => m.body.includes(`#${number}`))).toBe(true)
+    updateProject(projectId, { autoStart: 'simple' })
+    flushWrites()
+  })
+})
+
+
+describe('an answer nobody was left to read', () => {
+  /*
+   * The hibernation shape, exactly as reported: *"after hibernation I answer a few questions
+   * from the session that asked them. after that nothing happened, it did not spin back up."*
+   *
+   * The soft timeout inside `ask_user` falls due while the machine sleeps and Windows fires it
+   * the moment it wakes, so the waiter is gone. The agent was supposed to call `await_answer`
+   * to keep waiting, but its connection to the model died with the sleep, so that turn never
+   * happened. The question stays open with working buttons, and answering it writes the answer
+   * somewhere nobody is reading.
+   *
+   * `askUserGate.wait` has always handled the other half — "already answered while we were
+   * away (e.g. the process restarted)". The missing piece was anything to restart it.
+   */
+  it('starts the asker again, and says so', () => {
+    const { ticketId, agentId, number } = stalledTicket('Asked something')
+    const q = addQuestion({
+      projectId,
+      agentId,
+      ticketId,
+      question: 'Should the site be redeployed after an upgrade?',
+    })
+    // The user answered while nothing was listening.
+    answerQuestion(q.id, 'no', 'user')
+    flushWrites()
+
+    expect(wakeAsker(q.id)).toBe(true)
+    const said = listMessages(projectId).map((m) => m.body).join(' ')
+    expect(said).toContain('waiting for your answer')
+    void number
+  })
+
+  it('does nothing when the asker is already running', () => {
+    // `manager.forAgent` is empty in tests, so the honest version of this check is the other
+    // guard: an agent queued to start will collect the answer itself.
+    const { ticketId, agentId } = stalledTicket('Queued asker')
+    const q = addQuestion({ projectId, agentId, ticketId, question: 'Anything?' })
+    answerQuestion(q.id, 'yes', 'user')
+    flushWrites()
+
+    // First wake starts it, which puts it through the gate and marks it queued.
+    expect(wakeAsker(q.id)).toBe(true)
+    // A second answer must not take the process away from a turn that is mid-flight.
+    expect(wakeAsker(q.id)).toBe(false)
+  })
+
+  it('shrugs at a question that no longer exists', () => {
+    expect(wakeAsker('nope')).toBe(false)
+  })
+})
+
+/**
+ * The loop that could not end.
+ *
+ * A Claude session belongs to the directory it was created in, so once a worktree moves or is
+ * removed `--resume` answers "No conversation found with session ID: …" and will answer that
+ * for ever. Two things then conspired: the dead handle stayed on the agent row so every restart
+ * replayed it, and `agent:done` cleared the heal cooldown even when the run had died on the spot
+ * — so each failed restart bought the next one. The log filled with "Restarted: resuming the
+ * interrupted session" and "stopped: The model call failed", alternating, going nowhere.
+ */
+describe('a resume handle that can never work', () => {
+  it('is dropped, so the next start is a cold one that actually runs', () => {
+    const { agentId } = stalledTicket('Dead session')
+    setAgentSession(agentId, '20fed98b-6f75-4c5e-b342-30f28fb136a9')
+    flushWrites()
+    expect(getAgent(agentId)?.sessionId).toBeTruthy()
+
+    installTelemetry()
+    bus.emitAgent({
+      type: 'agent:error',
+      seq: 1,
+      ts: Date.now(),
+      projectId,
+      agentId,
+      runId: 'r1',
+      ticketId: null,
+      parentAgentId: null,
+      reason: 'api_error',
+      message: 'No conversation found with session ID: 20fed98b-6f75-4c5e-b342-30f28fb136a9',
+      recoverable: true,
+    })
+    flushWrites()
+    expect(getAgent(agentId)?.sessionId).toBeNull()
+  })
+})
+
+/**
+ * A cancelled ticket is not a stalled one.
+ *
+ * `archivedAt` was never checked, so the heal pass treated a ticket the user had just cancelled
+ * exactly like one that had stalled, and restarted the agent on it: *"i clicked cancel and now
+ * junior dev is working on the ticket thats not even in the kanban anymore"*. The card was off
+ * the board and the work carried on, because the one pass whose job is restarting things could
+ * not see it had been called off.
+ */
+describe('cancelled work stays cancelled', () => {
+  it('does not restart an agent on an archived ticket', () => {
+    const { ticketId, number } = stalledTicket('Cancelled mid-flight')
+    expect(detectStuckSteps(projectId, later()).map((s) => s.ticket.number)).toContain(number)
+
+    archiveTicket(ticketId)
+    flushWrites()
+
+    expect(detectStuckSteps(projectId, later()).map((s) => s.ticket.number)).not.toContain(number)
+  })
+})
+
+/**
+ * Opening the app should not show a wall of things that are not happening.
+ *
+ * A teammate left in `error` kept its last message for ever — "No conversation found with
+ * session ID: 21285116…" from a session that had stopped mattering hours before — and one whose
+ * ticket had since been cancelled still read "Interrupted when vibePilot closed" with a Restart
+ * button for work nobody wanted. Neither was a live problem; both looked like one.
+ */
+describe('what the roster says when the app opens', () => {
+  it('quietens a teammate with no live work, and keeps its history', () => {
+    const who = createAgent({
+      projectId, name: 'Yesterday', role: 'builder', provider: 'claude', model: 'sonnet',
+      isPilot: false, ephemeral: false, status: 'idle',
+    })
+    setAgentStatus(who.id, 'error', 'No conversation found with session ID: 21285116-5602')
+    flushWrites()
+
+    expect(settleAgentsOnBoot()).toBeGreaterThan(0)
+    const after = getAgent(who.id)!
+    expect(after.status).toBe('idle')
+    expect(after.statusLine).toBeNull()
+  })
+
+  /** The one that must survive: real work waiting is still `stalled`, so the resume finds it. */
+  it('leaves a teammate that genuinely has work waiting alone', () => {
+    const { agentId } = stalledTicket('Still wanted')
+    setAgentStatus(agentId, 'stalled', 'Interrupted when vibePilot closed')
+    flushWrites()
+
+    settleAgentsOnBoot()
+    expect(getAgent(agentId)?.status).toBe('stalled')
+  })
+
+  it('quietens one whose ticket was cancelled', () => {
+    const { agentId, ticketId } = stalledTicket('Cancelled')
+    setAgentStatus(agentId, 'stalled', 'Interrupted when vibePilot closed')
+    archiveTicket(ticketId)
+    flushWrites()
+
+    settleAgentsOnBoot()
+    expect(getAgent(agentId)?.status).toBe('idle')
+  })
+})
