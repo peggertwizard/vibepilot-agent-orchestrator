@@ -1,0 +1,226 @@
+/* App-local layer over the Industry design system.
+   Every value here is a var() reference into industry.css — no raw hex, per the system's
+   own adherence rules. The two exceptions are documented inline. */
+
+:root {
+  /* NOTE the inversion: --paper is the DS *surface* (app chrome), --surface is the DS
+     *neutral-100* (the workspace). They read backwards relative to the DS names, and
+     swapping them inverts the entire chrome/workspace relationship. */
+  --paper: var(--color-surface);
+  --surface: var(--color-neutral-100);
+  --pane: #ededee; /* bespoke: sits between paper and surface, no DS step matches */
+
+  --ink: var(--color-text);
+  --ink-2: var(--color-neutral-800);
+  --muted: var(--color-neutral-700);
+  --faint: var(--color-neutral-600);
+
+  --line: var(--color-neutral-300);
+  --line-2: var(--color-neutral-200);
+
+  --tint: var(--color-accent-200);
+  --accent: var(--color-accent);
+  --accent-soft: var(--color-accent-100);
+  --accent-ink: var(--color-accent-800);
+
+  --ok: var(--color-accent-700);
+  --ok-soft: var(--color-accent-100);
+  --warn: var(--color-neutral-700);
+  --warn-soft: var(--color-neutral-200);
+  --danger: #8c3b32; /* the only chromatic escape in the palette */
+  --caution: #b8792e; /* context meter, 60–90% band */
+
+  /* Epic spines. Bespoke, and deliberately restrained: these are index tabs, not a
+     category legend. Six saturated hues would fight the accent and turn a blueprint into a
+     rainbow, so these are low-chroma and near-equal in lightness — no epic should look more
+     important than another, and none should outrank --accent. They appear as a 2px left
+     edge on a card and nowhere else. */
+  --epic-1: #6b7f8c;
+  --epic-2: #8c7a6b;
+  --epic-3: #7a8c6b;
+  --epic-4: #7f6b8c;
+  --epic-5: #8c6b74;
+  --epic-6: #6b8c85;
+
+  /*
+   * Base reading size. 13px was chosen for density and read as cramped on a normal monitor;
+   * `compact` is still there for anyone who wants the old feel back.
+   */
+  --fs: 14px;
+  --row: 31px;
+  --cardpad: 10px 11px;
+}
+
+:root[data-density='compact'] {
+  --fs: 12px;
+  --row: 26px;
+  --cardpad: 8px 9px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--fs);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+
+/* Text the user might actually want to copy opts back in. */
+.selectable,
+input,
+textarea {
+  user-select: text;
+  cursor: auto;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--accent-ink);
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-neutral-400);
+  border-radius: 0;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-neutral-500);
+  background-clip: content-box;
+}
+
+/* ── the two motion primitives ─────────────────────────────────────────────────
+   vpbar   = "an agent is working"   (three staggered bars)
+   vpblink = "this needs you"        (a pulsing dot)
+   Nothing else in the app animates. */
+@keyframes vpbar {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+@keyframes vpblink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.15;
+  }
+}
+
+.vp-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 10px;
+}
+.vp-bars > i {
+  display: block;
+  width: 2px;
+  height: 10px;
+  background: currentColor;
+  transform-origin: bottom;
+  animation: vpbar 1.1s ease-in-out infinite;
+}
+.vp-bars > i:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.vp-bars > i:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+.vp-blink {
+  animation: vpblink 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vp-bars > i,
+  .vp-blink {
+    animation: none;
+  }
+  .vp-bars > i {
+    transform: scaleY(0.65);
+  }
+}
+
+/* ── frameless window drag region ──────────────────────────────────────────── */
+.drag {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* ── shared atoms used across panes ────────────────────────────────────────── */
+/*
+ * Sized up, because they were set for a drawing rather than for reading.
+ *
+ * `.meta` at 10px and `.cap` at 9.5px carry a great deal of the app's actual information —
+ * branch names, token counts, step notes, the line under every card — and at that size, in the
+ * faint colour, a lot of it simply was not being read. *"die schrift ist oft zu klein."*
+ *
+ * A restrained bump rather than a redesign: enough to be legible on a normal monitor, not so
+ * much that dense rows start wrapping. The uppercase caps gain the least because letter-spacing
+ * already does some of that work for them.
+ */
+.cap {
+  font: 500 10.5px var(--font-heading);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.meta {
+  font: 400 11.5px var(--font-heading);
+  color: var(--faint);
+}
+.mono {
+  font: 400 11.5px/1.6 ui-monospace, Menlo, Consolas, monospace;
+}
+.ellip {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scroll-y {
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Registration marks. The system's signature — square, hairline, transparent. */
+.blueprint > .corner {
+  pointer-events: none;
+}

@@ -1,0 +1,28 @@
+-- Work that starts on its own — and the ceiling that makes that safe.
+--
+-- Nothing has ever run without the Start button. That was built deliberately: an earlier
+-- version let the Pilot set `confident: true` and start work itself, which is how ticket #1
+-- came to have a teammate running before anything appeared on screen. The complaint then was
+-- not "it started work" — it was "it started work invisibly". Surprise, not speed.
+--
+-- So `auto_start` is a separate setting rather than a fourth meaning bolted onto `escalation`.
+-- Escalation answers "how much may an agent decide without asking me" — about questions, mid
+-- work. This answers "may work begin without me pressing a button". A user can reasonably
+-- want either without the other, and folding them together would make one of them unsettable.
+--
+--   never   every route waits for Start. What the app does today.
+--   simple  a single-step route with an assignee starts. Anything longer, or with a
+--           reviewer, or that the Pilot flagged as uncertain, waits.
+--   always  everything starts except the things that are irreversible or expensive:
+--           merging, deploying, an unmet dependency, or the spend ceiling.
+--
+-- Default `simple` for new projects. Existing rows get `never`, because changing what an
+-- installed app does on upgrade without being asked is precisely the surprise above.
+ALTER TABLE projects ADD COLUMN auto_start TEXT NOT NULL DEFAULT 'never';
+-- Superseded by migration 023, which makes `simple` the default for new and existing projects
+-- alike. Left as it was so the history reads honestly: this is what was decided at the time.
+
+-- `spend_ceiling_usd` has existed since 016, was validated on the way in, and was read by
+-- nothing. That was survivable while every launch needed a human press. It is not survivable
+-- once work starts by itself: with no button to not-press, the ceiling stops being a backstop
+-- and becomes the actual control. Enforced from this migration onwards.
